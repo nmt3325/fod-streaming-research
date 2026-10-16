@@ -1,0 +1,6 @@
+# Tested on CT104 with Python 3.13
+playwright==1.64.0
+pywidevine==1.9.0
+requests==2.34.2
+cryptography==49.0.0
+urllib3==2.8.0

@@ -1,0 +1,43 @@
+# Authentication and device credentials
+*.wvd
+*.wdv
+cookie.txt
+cookies.txt
+*cookie*.txt
+.env
+.env.*
+*.pem
+*.key
+*.p12
+*.pfx
+*token*
+*credentials*
+*secret*
+
+# Downloaded media and streams
+*.mp4
+*.mkv
+*.ts
+*.m4s
+*.m3u8
+*.mpd
+*.aac
+*.h264
+*.h265
+*.webm
+*.mov
+*.zip
+
+# Temporary playback parameters and diagnostics
+*.json
+*.log
+*.partial.*
+*.pending.*
+
+# Python and local tooling
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.DS_Store
