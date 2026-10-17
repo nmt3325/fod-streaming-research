@@ -105,10 +105,12 @@ def arguments():
     parser.add_argument("--wvd", type=Path, required=True, help="Widevineデバイスファイル")
     parser.add_argument("--url", required=True, help="FODのシリーズまたはエピソードページURL")
     parser.add_argument("--seconds", type=float, help="指定秒数だけ保存。省略すると全編")
-    parser.add_argument("--output", type=Path, help="エピソード時はMP4、シリーズ時は保存フォルダ")
+    parser.add_argument("--output", type=Path, default=Path("Shows"), help="Jellyfinテレビ番組ライブラリのルートフォルダ（既定: ./Shows）")
     parser.add_argument("--list-only", action="store_true", help="シリーズ内のエピソードを一覧表示して終了")
     parser.add_argument("--episodes", help="シリーズで指定した話数のみ（例: 1,3-5）")
     parser.add_argument("--overwrite", action="store_true", help="既存の正常な動画も再取得する")
+    parser.add_argument("--season", type=int, default=1, help="Jellyfinシーズン番号（既定: 1、特別編は0）")
+    parser.add_argument("--year", type=int, help="作品フォルダの制作・公開年（自動検出できない場合に指定）")
     args = parser.parse_args()
     for name in ("cookie", "wvd"):
         value=getattr(args,name)
@@ -122,6 +124,10 @@ def arguments():
         parser.error("--seconds は1〜3600の範囲で指定してください")
     args.is_series=bool(series_match)
     args.series_id=(series_match or episode_match).group(1)
+    if args.season<0 or args.season>999:
+        parser.error("--season は0〜999で指定してください")
+    if args.year is not None and not 1900<=args.year<=2100:
+        parser.error("--year は1900〜2100で指定してください")
     if (args.list_only or args.episodes) and not args.is_series:
         parser.error("--list-only、--episodes はシリーズURLで使用してください")
     return args
@@ -425,6 +431,60 @@ def transcode(media, output, seconds, keys=None):
     finally:
         candidate.unlink(missing_ok=True)
 
+
+def safe_name(value, max_bytes=140):
+    """Remove Jellyfin-reserved and cross-platform filesystem characters."""
+    invalid=set('<>:"/|?*') | {chr(92)}
+    text="".join(" " if c in invalid or ord(c)<32 or ord(c)==127 else c
+                 for c in str(value))
+    cleaned=" ".join(text.split()).strip(" .") or "Unknown"
+    result=[];size=0
+    for char in cleaned:
+        length=len(char.encode("utf8"))
+        if size+length>max_bytes:
+            break
+        result.append(char)
+        size+=length
+    return "".join(result).rstrip(" .") or "Unknown"
+
+
+def episode_title(label):
+    """Remove FOD episode numbering and displayed running time."""
+    label=re.sub(r"^\s*第\s*[0-9０-９]+\s*話\s*[-：:・]?\s*",
+                 "", label or "")
+    label=re.sub(r"\s*(?:[0-9０-９]+時間)?[0-9０-９]+分(?:[0-9０-９]+秒)?\s*$",
+                 "", label)
+    return safe_name(label,max_bytes=135) if label.strip() else ""
+
+
+def jellyfin_paths(library_root, series_title, year, season, index, title):
+    """TV-show layout: Show (Year)/Season 01/Show S01E01 - Title.mp4."""
+    series_title=safe_name(series_title,max_bytes=100)
+    show_folder=series_title+(f" ({year})" if year else "")
+    season_folder=f"Season {season:02d}"
+    prefix=f"{series_title} S{season:02d}E{index:02d}"
+    episode=episode_title(title)
+    stem=safe_name(prefix+(" - "+episode if episode else ""),max_bytes=215)
+    return Path(library_root)/show_folder/season_folder/(stem+".mp4")
+
+
+def library_root_from_output(output):
+    root=Path(output).expanduser().resolve()
+    if root.suffix.lower() in (".mp4",".mkv",".avi",".mov"):
+        print(f"Jellyfin形式で保存するため、--output はフォルダとして扱います: {root.parent}")
+        return root.parent
+    if root.exists() and not root.is_dir():
+        raise ValueError("--output にはJellyfin用の保存フォルダを指定してください")
+    return root
+
+
+def detect_year(series_body):
+    match=re.search(
+        r"(?m)^\s*[0-9０-９]+\s*エピソード[^\n]{0,80}?\b((?:19|20)\d{2})\b",
+        series_body or "")
+    return int(match.group(1)) if match else None
+
+
 def discover_series(page_url, cookies, series_id):
     """Discover episode links displayed by this specific series page."""
     episodes = []
@@ -439,6 +499,7 @@ def discover_series(page_url, cookies, series_id):
             page.goto(page_url,wait_until="domcontentloaded",timeout=45000)
             page.wait_for_timeout(4000)
             title=page.title().split("｜",1)[0].strip()
+            year=detect_year(page.locator("body").inner_text(timeout=5000))
             for _ in range(5):
                 anchors=page.locator("a[href]").evaluate_all(
                     r"""items => items.map(a => ({href:a.getAttribute('href') || '',
@@ -463,7 +524,7 @@ def discover_series(page_url, cookies, series_id):
             # FOD usually displays these chronologically, but numeric episode
             # IDs give a stable filename and deterministic resumption order.
             episodes.sort(key=lambda item: item["episode_id"])
-            return title, episodes
+            return title, episodes, year
         finally:
             browser.close()
 
@@ -557,46 +618,44 @@ def download_episode(args,episode_url,dest,jar,cookies, prefix=""):
         os.chmod(path,0o600)
 
 
+
 def main():
     args=arguments()
     os.umask(0o077)
     try:
         jar,cookies=cookie_list(args.cookie)
-        if not args.is_series:
-            output=args.output if args.output is not None else Path("fod_video.mp4")
-            report=download_episode(args,args.url,output,jar,cookies)
-            return 0 if report["status"]=="success" else 1
-
-        print("シリーズのエピソード一覧を確認しています…",flush=True)
-        title,all_episodes=discover_series(args.url,cookies,args.series_id)
-        positions=parse_selected_episodes(args.episodes,len(all_episodes))
-        chosen=[(i,item) for i,item in enumerate(all_episodes,1) if i in positions]
-        print(f"作品：{title} / 全{len(all_episodes)}話 / 対象{len(chosen)}話")
-        for i,item in chosen:
-            print(f"  {i:02d}: {item['title'][:85] or item['episode_id']}")
+        series_url=f"https://fod.fujitv.co.jp/title/{args.series_id}/"
+        print("シリーズ情報を確認しています…",flush=True)
+        title, all_episodes, detected_year=discover_series(series_url,cookies,args.series_id)
+        year=args.year if args.year is not None else detected_year
+        root=library_root_from_output(args.output)
+        if args.is_series:
+            positions=parse_selected_episodes(args.episodes,len(all_episodes))
+            chosen=[(i,item) for i,item in enumerate(all_episodes,1) if i in positions]
+        else:
+            requested=urlsplit(args.url).path.rstrip("/")
+            chosen=[(i,item) for i,item in enumerate(all_episodes,1)
+                    if urlsplit(item["url"]).path.rstrip("/")==requested]
+            if not chosen:
+                raise RuntimeError("シリーズ一覧に対象エピソードが見つかりません。正しいシリーズURLを確認してください")
+        print(f"作品：{title}"+(f" ({year})" if year else "")+
+              f" / Season {args.season:02d} / 全{len(all_episodes)}話 / 対象{len(chosen)}話")
+        targets=[(i,item,jellyfin_paths(root,title,year,args.season,i,item["title"]))
+                 for i,item in chosen]
+        for i,item,path in targets:
+            print(f"  {i:02d}: {item['title'][:90] or item['episode_id']} -> {path.name}")
 
         if args.list_only:
             print("一覧表示が完了しました。")
             return 0
-        if args.output is None:
-            directory=Path(f"fod_{args.series_id}")
-        elif args.output.suffix.lower()==".mp4":
-            directory=args.output.with_suffix("")
-            print(f"シリーズ指定のため保存先はフォルダ {directory} に変更します。")
-        else:
-            directory=args.output
-        directory=directory.expanduser().resolve()
-        directory.mkdir(parents=True,exist_ok=True)
-        if not directory.is_dir():
-            raise RuntimeError(f"保存先をディレクトリとして使用できません: {directory}")
-        summary_path=directory/"series_results.json"
+        show_directory=targets[0][2].parent.parent
+        summary_path=show_directory/"series_results.json"
         result={"series_id":args.series_id,"series_title":title,
+                "year":year,"season":args.season,
                 "episode_count":len(all_episodes),"selected":len(chosen),
                 "requested_seconds":args.seconds,"episodes":[]}
         failures=0
-        for i,item in chosen:
-            filename=f"{i:02d}_{item['episode_id']}.mp4"
-            dest=directory/filename
+        for i,item,dest in targets:
             print(f"\n[{i}/{len(all_episodes)}] {item['title'][:80] or item['episode_id']}",flush=True)
             if not args.overwrite and valid_existing_mp4(dest,args.seconds):
                 print("既に保存済みのためスキップします。")
@@ -608,12 +667,13 @@ def main():
                 if report["status"]!="success":
                     failures+=1
             result["episodes"].append(entry)
+            show_directory.mkdir(parents=True,exist_ok=True)
             temporary=summary_path.with_suffix(".json.tmp")
             temporary.write_text(json.dumps(result,ensure_ascii=False,indent=2)+"\n",encoding="utf8")
             os.chmod(temporary,0o600)
             os.replace(temporary,summary_path)
-        success=sum(item["status"] in ("success","skipped") for item in result["episodes"])
-        print(f"\n処理結果：{success}/{len(chosen)}話 成功。保存先：{directory}",flush=True)
+        successes=sum(item["status"] in ("success","skipped") for item in result["episodes"])
+        print(f"\n処理結果：{successes}/{len(chosen)}話 成功。保存先：{show_directory}",flush=True)
         return 1 if failures else 0
     except Exception as exc:
         print("エラー："+str(exc).split("?")[0][:200],flush=True)

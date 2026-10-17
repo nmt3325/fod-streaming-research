@@ -1,25 +1,14 @@
 # FOD Streaming Research Demo
 
-Private repository for a command-line demonstration of FOD streaming compatibility and content-protection behavior. The script accepts user-supplied authentication files and a FOD page URL and selects the playback stream format automatically.
+Private command-line demo for studying streaming delivery and playback compatibility. The script accepts user-supplied authentication files, automatically detects the stream format, and saves ordinary seekable MP4 files. Store credentials and media outside this repository.
 
 ## Requirements
 
-- Python 3.13 (the version used for verification)
-- Chromium or Google Chrome browser (Playwright-managed Chromium is preferred; macOS Chrome and Linux Chromium are detected automatically)
-- FFmpeg and FFprobe (discovered automatically on Linux and macOS, including Homebrew)
-- Packages in `requirements.txt`
+- Python 3.13 (verified), packages in `requirements.txt`
+- Chromium / Google Chrome or Playwright-managed Chromium
+- FFmpeg and FFprobe (Linux and macOS/Homebrew paths detected automatically)
 
-### Setup (Debian/Ubuntu)
-
-```bash
-sudo apt-get install -y chromium ffmpeg python3-venv
-python3 -m venv .venv
-.venv/bin/python -m pip install -r requirements.txt
-```
-
-### Setup (macOS, including Apple Silicon)
-
-With Homebrew installed:
+### macOS
 
 ```bash
 brew install ffmpeg
@@ -29,58 +18,80 @@ python -m pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-A browser is required in addition to the Python `playwright` package. The command `python -m playwright install chromium` installs the Playwright-managed browser. The code also detects Google Chrome in `/Applications` automatically.
-
-The following environment overrides are available:
-
-- `CHROME_PATH`: explicit Chrome/Chromium executable (e.g., `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`)
-- `FOD_FFMPEG_BIN`: explicit FFmpeg executable
-- `FOD_FFPROBE_BIN`: explicit FFprobe executable
-
-On macOS, no `/usr/bin/chromium` path is required. Use `python -m playwright install chromium` if no supported system browser is installed.
-
-## Usage
-
-### A single episode
+### Debian / Ubuntu
 
 ```bash
-.venv/bin/python fod_demo.py \
+sudo apt-get install -y chromium ffmpeg python3-venv
+python3 -m venv .venv
+.venv/bin/python -m pip install -r requirements.txt
+```
+
+Environment variables: `CHROME_PATH`, `FOD_FFMPEG_BIN`, and `FOD_FFPROBE_BIN` override automatic executable discovery.
+
+## Jellyfin TV-show layout
+
+The `--output` argument specifies the Jellyfin **Shows library root directory**, not the name of an individual MP4 file. Default: `./Shows`.
+
+```text
+Shows/
+└── リーガルハイ (2013)/
+    ├── Season 01/
+    │   ├── リーガルハイ S01E01 - 完全復活・古美門研介！….mp4
+    │   └── リーガルハイ S01E02 - 逆ギレ天才起業家～….mp4
+    └── series_results.json
+```
+
+- The series folder uses `Series Name (Year)`; the year is inferred from FOD when available, or overridden with `--year 2013`.
+- Each episode is named `Series Name S01E01 - Episode Title.mp4` inside `Season 01`. Restricted filename characters are removed and long names are truncated to filesystem-safe lengths.
+- The season defaults to `1`. Use `--season 2` if the FOD series corresponds to season 2 of the show in Jellyfin. The service's series ID is **not** necessarily the Jellyfin season number.
+- Specials can be placed under `Season 00` with `--season 0`.
+- Existing media files are not automatically migrated or renamed.
+
+### Download one series
+
+```bash
+python fod_demo.py \
+  --cookie /path/to/cookie.txt \
+  --wvd /path/to/device.wvd \
+  --url 'https://fod.fujitv.co.jp/title/4534/' \
+  --season 2 \
+  --output ./Shows
+```
+
+### Download one episode
+
+```bash
+python fod_demo.py \
   --cookie /path/to/cookie.txt \
   --wvd /path/to/device.wvd \
   --url 'https://fod.fujitv.co.jp/title/4534/4534110002/' \
-  --output episode.mp4
+  --season 2 \
+  --output ./Shows
 ```
 
-### List episodes from a series
+Even with a single episode URL, the script identifies the series, year and episode title to place the result in Jellyfin folders. For backward compatibility, if you specify `--output demo.mp4`, the parent folder is used as the Shows library root; the name `demo.mp4` is ignored.
+
+### List episodes without downloading
 
 ```bash
-.venv/bin/python fod_demo.py \
+python fod_demo.py \
   --cookie /path/to/cookie.txt \
   --wvd /path/to/device.wvd \
   --url 'https://fod.fujitv.co.jp/title/4534/' \
   --list-only
 ```
 
-### Series output
+Other options: `--episodes 1,3-5` selects a subset of series episodes; `--seconds 15` limits the selected duration per episode (omitting it means full episodes); `--overwrite` replaces existing validated MP4 files. Successfully saved episode files are skipped on subsequent series runs.
 
-```bash
-.venv/bin/python fod_demo.py \
-  --cookie /path/to/cookie.txt \
-  --wvd /path/to/device.wvd \
-  --url 'https://fod.fujitv.co.jp/title/4534/' \
-  --output ./series_4534/
-```
-
-The `--seconds N` flag limits each episode to N seconds. Without it, the entire episode is selected. Use `--episodes 1,3-5` to select episodes by position in the series listing, or `--overwrite` to replace a previously validated file. Existing valid MP4s are skipped by default when running on a series.
-
-`--cookie` expects Netscape-format cookies; `--wvd` expects a WVD device file. **Neither file is included in this repository.**
+`--cookie`, `--wvd` and `--url` remain required arguments. Store the Netscape-format cookie file and device WVD outside the repository. Neither is provided here. Only process media you are authorized to access.
 
 ## Outputs and testing
 
-- Single episode: MP4 file and JSON result.
-- Series: one MP4 per episode and a `series_results.json` progress report in the requested output directory.
-- The code creates ordinary seekable MP4 files with both video and audio, then verifies the container before publishing the final output filename.
+- Episodes: standard MP4 under `Show (Year)/Season NN/` plus per-episode JSON report.
+- Series: the same episode structure plus `series_results.json` in the show folder.
+- Media is verified for video/audio tracks and MP4 structure before publication under the final name.
+- Series page `title/4534` was verified to return ten episodes and year 2013.
+- Jellyfin path/name generation, single-episode and series batch placement, resume/skip and overrides were tested without downloading protected media.
+- Actual macOS Jellyfin library recognition is not yet confirmed.
 
-Tested on CT104 with Chromium 154, FFmpeg 7.1.5, and Python 3.13. Series page discovery was validated on `title/4534` (10 episodes). Single-episode full-length MP4 output was validated on episode `4534110002`. Series batch selection/resume logic was unit-tested; an end-to-end full-series acquisition has not been verified.
-
-Store cookies, WVD files, output media and logs outside the repository directory. `.gitignore` additionally excludes common sensitive and generated file types.
+Official Jellyfin TV-show naming guide: https://jellyfin.org/docs/general/server/media/shows/
