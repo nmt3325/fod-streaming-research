@@ -26,7 +26,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
-from playwright.sync_api import sync_playwright
 from subtitle_utils import Track, hls_tracks, hls_inband_captions, dash_tracks, materialize
 from pywidevine.cdm import Cdm
 from pywidevine.device import Device
@@ -35,47 +34,6 @@ from pywidevine.pssh import PSSH
 LICENSE_SERVER = "https://cenc.webstream.ne.jp/drmapi/wv/fujitv"
 WIDEVINE_SCHEME = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
 
-
-def launch_browser(pw):
-    """Use Playwright-managed Chromium, then an installed system browser."""
-    selected=os.getenv("CHROME_PATH")
-    if selected:
-        if not Path(selected).is_file():
-            raise RuntimeError(f"CHROME_PATH path not found: {selected}")
-        return pw.chromium.launch(headless=True,executable_path=selected)
-    failures=[]
-    try:
-        return pw.chromium.launch(headless=True)
-    except Exception as exc:
-        failures.append(type(exc).__name__)
-    candidates=[]
-    if sys.platform=="darwin":
-        candidates.extend([
-            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-            str(Path.home()/"Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
-            "/Applications/Chromium.app/Contents/MacOS/Chromium",
-            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"])
-    elif sys.platform.startswith("linux"):
-        candidates.extend(["/usr/bin/chromium","/usr/bin/chromium-browser",
-                           "/usr/bin/google-chrome"])
-    for executable in ("chromium","chromium-browser","google-chrome","chrome"):
-        resolved=shutil.which(executable)
-        if resolved:
-            candidates.append(resolved)
-    for executable in dict.fromkeys(candidates):
-        if not Path(executable).is_file():
-            continue
-        try:
-            options={"headless":True,"executable_path":executable}
-            if sys.platform.startswith("linux"):
-                options["args"]=["--no-sandbox"]
-            return pw.chromium.launch(**options)
-        except Exception as exc:
-            failures.append(f"{Path(executable).name}:{type(exc).__name__}")
-    raise RuntimeError(
-        "Chromiumを起動できません。python -m playwright install chromium "
-        "を実行するか、CHROME_PATHでブラウザの実行ファイルを指定してください。"
-        " 詳細: " + ", ".join(failures[-4:]))
 
 
 def media_executable(name):
@@ -148,68 +106,66 @@ def cookie_list(filepath):
     if not data:raise RuntimeError("有効なCookieがありません")
     return jar,data
 
-def authorized_manifest(page_url, cookies):
-    # Register the listener BEFORE navigation, then wait for a valid response
-    # rather than relying on a fixed 6.5-second delay.
-    responses = []
-    manifests = []
-    player_subtitles = []
-    errors = []
-    with sync_playwright() as pw:
-        browser = launch_browser(pw)
-        try:
-            context = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo")
-            context.add_cookies(cookies)
-            page = context.new_page()
-            def got_response(response):
-                try:
-                    path = urlsplit(response.url).path
-                    if path == "/apps/api/1/auth/contents/web":
-                        if response.status != 200:
-                            errors.append(f"再生認可API: HTTP {response.status}")
-                            return
-                        data = response.json()
-                        if isinstance(data, dict) and data.get("url"):
-                            responses.append({
-                                "url": data.get("url"), "ticket": data.get("ticket", "")})
-                        else:
-                            errors.append("再生認可APIが動画URLを返しませんでした")
-                    elif path.endswith(".m3u8") and response.status == 200:
-                        manifests.append(response.url)
-                    elif path.lower().endswith((".vtt",".srt",".ttml",".dfxp")) and response.status == 200:
-                        if response.url not in player_subtitles:
-                            player_subtitles.append(response.url)
-                except Exception as e:
-                    errors.append(f"再生情報の応答処理: {type(e).__name__}")
-            page.on("response", got_response)
+def new_http_session(cookie_jar, page_url):
+    """Initialize the site's ordinary cookie session without JavaScript."""
+    session=requests.Session()
+    session.cookies=cookie_jar
+    session.headers.update({
+        "User-Agent":"Mozilla/5.0 (compatible; FOD-CLI/1.0)",
+        "Referer":page_url,
+        "Accept":"application/json, text/plain, */*",
+    })
+    response=session.get(page_url,timeout=25)
+    response.raise_for_status()
+    session_tokens={cookie.name:cookie.value for cookie in session.cookies}
+    token=session_tokens.get("UT")
+    if not token:
+        session.close()
+        raise RuntimeError("FODのセッショントークンが取得できません。Cookieとログイン状態を確認してください")
+    session.headers["x-authorization"]="Bearer "+token
+    return session,session_tokens
 
-            for attempt in range(2):
-                if attempt == 0:
-                    page.goto(page_url, wait_until="domcontentloaded", timeout=45000)
-                else:
-                    page.reload(wait_until="domcontentloaded", timeout=45000)
-                deadline = time.monotonic() + 25
-                playback_found_at = None
-                while time.monotonic() < deadline:
-                    best = next((item for item in reversed(responses)
-                        if urlsplit(item["url"]).scheme == "https"
-                        and urlsplit(item["url"]).path.lower().endswith((".m3u8",".mpd"))),None)
-                    if best is None and manifests:
-                        best = {"url": manifests[-1], "ticket": ""}
-                    if best is not None:
-                        if playback_found_at is None:
-                            playback_found_at = time.monotonic()
-                        # Some players request captions separately, after the
-                        # stream manifest, even if CC is disabled by default.
-                        if player_subtitles or time.monotonic()-playback_found_at >= 7:
-                            return {**best,"player_subtitles":list(player_subtitles[:8])}
-                    page.wait_for_timeout(350)
-            reason = "; ".join(errors[-3:]) if errors else "再生認可APIから配信情報を確認できません"
-            raise RuntimeError(
-                "動画配信情報の取得に失敗しました（ページ再読み込み後も応答なし）。"
-                + reason)
-        finally:
-            browser.close()
+
+def authorized_manifest(page_url, cookie_jar):
+    """Fetch playback metadata using the same authorized HTTP session as the site."""
+    match=re.fullmatch(r"/title/([0-9A-Za-z]+)/([0-9A-Za-z]+)/?",
+                       urlsplit(page_url).path)
+    if not match:
+        raise ValueError("エピソードURLが正しくありません")
+    session,tokens=new_http_session(cookie_jar,page_url)
+    try:
+        params={
+            "site_id":"fodapp",
+            "ep_id":match.group(2),
+            "qa":"high",
+            "uuid":tokens.get("uuid",""),
+            "starttime":"0",
+            "is_pt":"false",
+            "_":str(int(time.time()*1000)),
+        }
+        if not params["uuid"]:
+            raise RuntimeError("セッション識別情報が見つかりません")
+        response=session.get(
+            "https://fod.fujitv.co.jp/apps/api/1/auth/contents/web",
+            params=params,
+            headers={"x-requested-with":"XMLHttpRequest"},
+            timeout=30)
+        response.raise_for_status()
+        data=response.json()
+        if not isinstance(data,dict):
+            raise RuntimeError("動画認可APIの応答形式が不正です")
+        stream=data.get("url")
+        if not isinstance(stream,str) or urlsplit(stream).scheme!="https" or not urlsplit(stream).path.lower().endswith((".m3u8",".mpd")):
+            raise RuntimeError("動画認可APIから有効な配信URLを取得できませんでした")
+        captions=data.get("vtt_url")
+        subtitle_urls=[]
+        if isinstance(captions,str) and urlsplit(captions).scheme=="https" and urlsplit(captions).path.lower().endswith((".vtt",".srt",".ttml",".dfxp")):
+            subtitle_urls.append(captions)
+        return {"url":stream,"ticket":data.get("ticket") or "",
+                "player_subtitles":subtitle_urls}
+    finally:
+        session.close()
+
 
 def get(session,url,range_header=None,stream=False):
     opts={"timeout":30,"headers":{"Referer":"https://fod.fujitv.co.jp/"}}
@@ -617,33 +573,68 @@ def select_numbered_episodes(raw_links, series_id, base_url):
     return result
 
 
-def discover_series(page_url, cookies, series_id):
-    """Discover numbered episode links displayed by this series page."""
-    gathered = []
-
-    with sync_playwright() as pw:
-        browser = launch_browser(pw)
-        try:
-            context = browser.new_context(locale="ja-JP",timezone_id="Asia/Tokyo")
-            context.add_cookies(cookies)
-            page = context.new_page()
-            page.goto(page_url,wait_until="domcontentloaded",timeout=45000)
-            page.wait_for_timeout(4000)
-            title=page.title().split("｜",1)[0].strip()
-            year=detect_year(page.locator("body").inner_text(timeout=5000))
-            for _ in range(5):
-                anchors=page.locator("a[href]").evaluate_all(
-                    r"""items => items.map(a => ({href:a.getAttribute('href') || '',
-                    title:(a.innerText || a.textContent || '').trim().replace(/\s+/g,' ').slice(0,180)}))""")
-                gathered.extend(anchors)
-                page.evaluate("window.scrollTo(0,document.body.scrollHeight)")
-                page.wait_for_timeout(500)
-            episodes=select_numbered_episodes(gathered,series_id,page_url)
-            if not episodes:
-                raise RuntimeError("シリーズページから番号付きエピソードを取得できませんでした")
-            return title, episodes, year
-        finally:
-            browser.close()
+def discover_series(page_url, cookie_jar, series_id):
+    """Read the official series metadata endpoint without starting a browser."""
+    session,_=new_http_session(cookie_jar,page_url)
+    try:
+        response=session.get(
+            "https://i.fod.fujitv.co.jp/apps/api/c/v3/lineup/detail/",
+            params={
+                "lu_id":series_id,
+                "is_premium":"false",
+                "dv_type":"web",
+                "is_kids":"false",
+                "is_lite":"false",
+            },
+            timeout=30)
+        response.raise_for_status()
+        payload=response.json()
+        if not isinstance(payload,dict) or not isinstance(payload.get("detail"),dict):
+            raise RuntimeError("シリーズ詳細APIの応答形式が不正です")
+        detail=payload["detail"]
+        title=detail.get("lu_title") or series_id
+        date_info=str(detail.get("period") or "")
+        year_match=re.search(r"\b((?:19|20)\d{2})\b", date_info)
+        year=int(year_match.group(1)) if year_match else None
+        candidates=[]
+        for entry in payload.get("episodes",[]):
+            if not isinstance(entry,dict) or entry.get("is_teaser"):
+                continue
+            ep_id=entry.get("ep_id")
+            if not isinstance(ep_id,str) or not re.fullmatch(r"[0-9A-Za-z]+",ep_id):
+                continue
+            title_text=str(entry.get("ep_title") or "").strip()
+            episode_marker=str(entry.get("disp_ep_no") or title_text)
+            matched=re.search(r"第\s*([0-9０-９]+)\s*話",episode_marker)
+            if not matched:
+                continue
+            number=int(matched.group(1))
+            if number<1:continue
+            if not title_text.startswith("第"):
+                title_text=(matched.group(0)+" "+title_text).strip()
+            try:
+                order=int(entry.get("sort_number") or 9999)
+            except (ValueError,TypeError):
+                order=9999
+            commentary=any(word in title_text for word in
+                ("解説放送版","オーディオコメンタリー","ダイジェスト","予告"))
+            candidates.append((number,commentary,order,{
+                "episode_number":number,
+                "episode_id":ep_id,
+                "title":title_text,
+                "url":f"https://fod.fujitv.co.jp/title/{series_id}/{ep_id}/",
+            }))
+        selected={}
+        for number,commentary,order,item in sorted(candidates,
+                                                    key=lambda x:(x[1],x[2],x[0])):
+            if number not in selected:
+                selected[number]=item
+        episodes=[selected[number] for number in sorted(selected)]
+        if not episodes:
+            raise RuntimeError("シリーズ情報に本編の話数が見つかりません")
+        return title,episodes,year
+    finally:
+        session.close()
 
 
 def parse_selected_episodes(spec,total):
@@ -711,7 +702,7 @@ def download_episode(args,episode_url,dest,jar,cookies, prefix=""):
             "requested_seconds":args.seconds,"output":str(dest)}
     try:
         log("1/3 動画を確認しています…")
-        playback=authorized_manifest(episode_url,cookies)
+        playback=authorized_manifest(episode_url,jar)
         stream_url=playback["url"]
         ext=urlsplit(stream_url).path.lower()
         if ext.endswith(".mpd"):mode="dash"
@@ -771,7 +762,7 @@ def main():
         jar,cookies=cookie_list(args.cookie)
         series_url=f"https://fod.fujitv.co.jp/title/{args.series_id}/"
         print("シリーズ情報を確認しています…",flush=True)
-        title, all_episodes, detected_year=discover_series(series_url,cookies,args.series_id)
+        title, all_episodes, detected_year=discover_series(series_url,jar,args.series_id)
         year=args.year if args.year is not None else detected_year
         root=library_root_from_output(args.output)
         if args.is_series:

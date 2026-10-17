@@ -24,3 +24,10 @@ Test date: 2026-10-17. Host: CT104. Target: FOD episode 01bl110030 (ポリティ
 - The actual CC ON interface action was not successfully performed in the remote browser; the resulting on-screen rendering of subtitles remains unconfirmed.
 - The complete episode with captions has not been downloaded by the revised end-to-end workflow. The test above validates a 60-second sample.
 - This test does not establish that every other FOD series publishes the same sort of WebVTT caption track.
+
+
+## Follow-up: HTTP-only workflow (no Playwright)
+
+The official session and playback metadata endpoints returned both a valid m3u8 playback URL and a vtt_url caption reference using ordinary requests. Playwright and Chromium were removed from the application and its requirements.
+
+The revised CLI generated a 15.018667-second test MP4, size 5,012,615 bytes, using requests and FFmpeg only. FFprobe confirmed H.264 video, AAC audio and Japanese mov_text subtitles. Subtitle extraction from the MP4 succeeded. The end-to-end run took 2.46 seconds.

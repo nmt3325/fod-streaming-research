@@ -5,7 +5,7 @@ Private command-line demo for studying streaming delivery and playback compatibi
 ## Requirements
 
 - Python 3.13 (verified), packages in `requirements.txt`
-- Chromium / Google Chrome or Playwright-managed Chromium
+- No browser, Chromium or Playwright is required
 - FFmpeg and FFprobe (Linux and macOS/Homebrew paths detected automatically)
 
 ### macOS
@@ -15,18 +15,23 @@ brew install ffmpeg
 python3 -m venv venv
 source venv/bin/activate
 python -m pip install -r requirements.txt
-python -m playwright install chromium
 ```
 
 ### Debian / Ubuntu
 
 ```bash
-sudo apt-get install -y chromium ffmpeg python3-venv
+sudo apt-get install -y ffmpeg python3-venv
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-Environment variables: `CHROME_PATH`, `FOD_FFMPEG_BIN`, and `FOD_FFPROBE_BIN` override automatic executable discovery.
+Environment overrides: FOD_FFMPEG_BIN and FOD_FFPROBE_BIN. No browser executable is needed.
+
+## Browser-free HTTP mode
+
+The CLI no longer imports Playwright or needs Chromium. It uses the account cookies in the user-provided Netscape cookie file to initialize an ordinary HTTPS session, fetch the series metadata, and obtain playback information. When the playback API provides a vtt_url field, the text subtitles are processed automatically as before.
+
+CT104 verified: requests-only series discovery for 01bl and 4534, followed by a full 15-second episode workflow producing H.264 video, AAC audio, and a Japanese mov_text subtitle track in 2.46 seconds. No browser was launched in the revised workflow.
 
 ## Jellyfin TV-show layout
 

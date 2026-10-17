@@ -1,5 +1,4 @@
-# Tested on CT104 with Python 3.13
-playwright==1.64.0
+# Browser-free CLI, tested on CT104 with Python 3.13
 pywidevine==1.9.0
 requests==2.34.2
 cryptography==49.0.0
