@@ -27,7 +27,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from playwright.sync_api import sync_playwright
-from subtitle_utils import hls_tracks, hls_inband_captions, dash_tracks, materialize
+from subtitle_utils import Track, hls_tracks, hls_inband_captions, dash_tracks, materialize
 from pywidevine.cdm import Cdm
 from pywidevine.device import Device
 from pywidevine.pssh import PSSH
@@ -153,6 +153,7 @@ def authorized_manifest(page_url, cookies):
     # rather than relying on a fixed 6.5-second delay.
     responses = []
     manifests = []
+    player_subtitles = []
     errors = []
     with sync_playwright() as pw:
         browser = launch_browser(pw)
@@ -175,6 +176,9 @@ def authorized_manifest(page_url, cookies):
                             errors.append("再生認可APIが動画URLを返しませんでした")
                     elif path.endswith(".m3u8") and response.status == 200:
                         manifests.append(response.url)
+                    elif path.lower().endswith((".vtt",".srt",".ttml",".dfxp")) and response.status == 200:
+                        if response.url not in player_subtitles:
+                            player_subtitles.append(response.url)
                 except Exception as e:
                     errors.append(f"再生情報の応答処理: {type(e).__name__}")
             page.on("response", got_response)
@@ -185,13 +189,20 @@ def authorized_manifest(page_url, cookies):
                 else:
                     page.reload(wait_until="domcontentloaded", timeout=45000)
                 deadline = time.monotonic() + 25
+                playback_found_at = None
                 while time.monotonic() < deadline:
-                    for item in reversed(responses):
-                        uri = urlsplit(item["url"])
-                        if uri.scheme == "https" and uri.path.lower().endswith((".m3u8", ".mpd")):
-                            return item
-                    if manifests:
-                        return {"url": manifests[-1], "ticket": ""}
+                    best = next((item for item in reversed(responses)
+                        if urlsplit(item["url"]).scheme == "https"
+                        and urlsplit(item["url"]).path.lower().endswith((".m3u8",".mpd"))),None)
+                    if best is None and manifests:
+                        best = {"url": manifests[-1], "ticket": ""}
+                    if best is not None:
+                        if playback_found_at is None:
+                            playback_found_at = time.monotonic()
+                        # Some players request captions separately, after the
+                        # stream manifest, even if CC is disabled by default.
+                        if player_subtitles or time.monotonic()-playback_found_at >= 7:
+                            return {**best,"player_subtitles":list(player_subtitles[:8])}
                     page.wait_for_timeout(350)
             reason = "; ".join(errors[-3:]) if errors else "再生認可APIから配信情報を確認できません"
             raise RuntimeError(
@@ -345,7 +356,7 @@ def subtitle_language(language):
 
 
 def available_subtitles(session, mode, manifest_url, manifest_xml, folder,
-                        seconds_limit, notify):
+                        seconds_limit, notify, player_urls=None):
     """Find accessible subtitle text tracks and prepare a muxable SRT per language."""
     if mode=="hls":
         master=get(session,manifest_url).decode("utf-8-sig")
@@ -354,6 +365,15 @@ def available_subtitles(session, mode, manifest_url, manifest_xml, folder,
             notify("注意：映像内字幕（CC）が宣言されていますが、独立した字幕ファイルはありません。")
     else:
         choices=dash_tracks(manifest_xml,manifest_url)
+    for url in player_urls or []:
+        path=urlsplit(url).path.lower()
+        if not path.endswith((".vtt",".srt",".ttml",".dfxp")):
+            continue
+        # The player may not advertise the track in EXT-X-MEDIA.
+        # Infer "ja" only from a recognized _ja / -ja filename suffix.
+        match=re.search(r"(?:_|-)(ja|en|ko|zh|fr|de|es)(?:_|-|[.])",path)
+        language=match.group(1) if match else "und"
+        choices.append(Track(url,language,"Player captions","player"))
     if not choices:
         notify("独立した字幕トラックは検出されませんでした。")
         return [],True
@@ -717,7 +737,8 @@ def download_episode(args,episode_url,dest,jar,cookies, prefix=""):
             subtitles=[]
             if not args.no_subtitles:
                 subtitles,_=available_subtitles(session,mode,stream_url,
-                    manifest if mode=="dash" else None,folder,args.seconds,log)
+                    manifest if mode=="dash" else None,folder,args.seconds,log,
+                    player_urls=playback.get("player_subtitles"))
             report["subtitle_checked"]=not args.no_subtitles
             report["subtitle_tracks"]=[{"language":s["language"],
                                         "name":s["name"],"cues":s["cues"]}

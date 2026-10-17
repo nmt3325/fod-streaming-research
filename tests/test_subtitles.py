@@ -52,6 +52,23 @@ class SubtitleTests(unittest.TestCase):
             self.assertEqual(tracks,[])
             self.assertTrue(checked)
 
+    def test_player_side_vtt_fallback_when_hls_has_no_subtitles(self):
+        master="https://example.test/stream/master.m3u8"
+        player="https://cdn.example.test/01bl/01bl11003037ow_ja.vtt"
+        payload={
+            master:b"#EXTM3U\\n#EXT-X-STREAM-INF:BANDWIDTH=800\\nvideo.m3u8",
+            player:b"WEBVTT\\n\\n00:00:14.004 --> 00:00:18.500\\ncaption from player\\n"}
+        payload={k:v.replace(bytes([92,110]),bytes([10])) for k,v in payload.items()}
+        with tempfile.TemporaryDirectory() as folder:
+            with patch.object(demo,"get",side_effect=lambda sess,url:payload[url]):
+                tracks,checked=demo.available_subtitles(
+                    None,"hls",master,None,Path(folder),60,
+                    lambda msg:None,player_urls=[player])
+            self.assertTrue(checked)
+            self.assertEqual(len(tracks),1)
+            self.assertEqual(tracks[0]["language"],"jpn")
+            self.assertEqual(tracks[0]["cues"],1)
+
     def test_clip_and_merge(self):
         with tempfile.TemporaryDirectory() as directory:
             f=Path(directory)/"caption.srt"
