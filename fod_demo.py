@@ -11,6 +11,7 @@ import argparse
 import http.cookiejar
 import json
 import os
+import shutil
 import re
 import struct
 import subprocess
@@ -32,6 +33,71 @@ from pywidevine.pssh import PSSH
 
 LICENSE_SERVER = "https://cenc.webstream.ne.jp/drmapi/wv/fujitv"
 WIDEVINE_SCHEME = "edef8ba9-79d6-4ace-a3c8-27dcd51d21ed"
+
+
+def launch_browser(pw):
+    """Use Playwright-managed Chromium, then an installed system browser."""
+    selected=os.getenv("CHROME_PATH")
+    if selected:
+        if not Path(selected).is_file():
+            raise RuntimeError(f"CHROME_PATH path not found: {selected}")
+        return pw.chromium.launch(headless=True,executable_path=selected)
+    failures=[]
+    try:
+        return pw.chromium.launch(headless=True)
+    except Exception as exc:
+        failures.append(type(exc).__name__)
+    candidates=[]
+    if sys.platform=="darwin":
+        candidates.extend([
+            "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
+            str(Path.home()/"Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            "/Applications/Chromium.app/Contents/MacOS/Chromium",
+            "/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"])
+    elif sys.platform.startswith("linux"):
+        candidates.extend(["/usr/bin/chromium","/usr/bin/chromium-browser",
+                           "/usr/bin/google-chrome"])
+    for executable in ("chromium","chromium-browser","google-chrome","chrome"):
+        resolved=shutil.which(executable)
+        if resolved:
+            candidates.append(resolved)
+    for executable in dict.fromkeys(candidates):
+        if not Path(executable).is_file():
+            continue
+        try:
+            options={"headless":True,"executable_path":executable}
+            if sys.platform.startswith("linux"):
+                options["args"]=["--no-sandbox"]
+            return pw.chromium.launch(**options)
+        except Exception as exc:
+            failures.append(f"{Path(executable).name}:{type(exc).__name__}")
+    raise RuntimeError(
+        "Chromiumを起動できません。python -m playwright install chromium "
+        "を実行するか、CHROME_PATHでブラウザの実行ファイルを指定してください。"
+        " 詳細: " + ", ".join(failures[-4:]))
+
+
+def media_executable(name):
+    """Find ffmpeg/ffprobe on macOS Homebrew, Linux and custom installs."""
+    key="FOD_FFMPEG_BIN" if name=="ffmpeg" else "FOD_FFPROBE_BIN"
+    override=os.getenv(key)
+    if override:
+        resolved=override if Path(override).is_file() else shutil.which(override)
+        if not resolved:
+            raise RuntimeError(f"{key} executable not found: {override}")
+        return str(resolved)
+    candidates=[]
+    if sys.platform.startswith("linux"):
+        candidates.append(f"/usr/bin/{name}")
+    candidates.append(shutil.which(name))
+    if sys.platform=="darwin":
+        candidates.extend([f"/opt/homebrew/bin/{name}",f"/usr/local/bin/{name}"])
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file():
+            return str(candidate)
+    raise RuntimeError(
+        f"{name} が見つかりません。macOS: brew install ffmpeg、"
+        "Debian/Ubuntu: sudo apt-get install ffmpeg")
 
 def arguments():
     parser = argparse.ArgumentParser(description="FOD発表用：配信方式を自動判別して動画を保存")
@@ -81,10 +147,7 @@ def authorized_manifest(page_url, cookies):
     manifests = []
     errors = []
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            executable_path=os.getenv("CHROME_PATH", "/usr/bin/chromium"),
-            args=["--no-sandbox"])
+        browser = launch_browser(pw)
         try:
             context = browser.new_context(locale="ja-JP", timezone_id="Asia/Tokyo")
             context.add_cookies(cookies)
@@ -268,9 +331,7 @@ def widevine_keys(session,manifest_xml,device_path,ticket):
 def transcode(media, output, seconds, keys=None):
     # The previously selected static ffmpeg can leave an incomplete MP4 when
     # full-episode muxing fails. Keep the final filename untouched until verified.
-    ffmpeg_bin = os.environ.get("FOD_FFMPEG_BIN", "/usr/bin/ffmpeg")
-    if not Path(ffmpeg_bin).is_file():
-        ffmpeg_bin = "ffmpeg"
+    ffmpeg_bin = media_executable("ffmpeg")
     candidate = output.with_name("." + output.stem + ".partial.mp4")
     diagnostic = output.with_suffix(".ffmpeg.log")
     candidate.unlink(missing_ok=True)
@@ -340,7 +401,7 @@ def transcode(media, output, seconds, keys=None):
         # Fragmented MP4 may show only ~4 seconds in media players despite
         # FFprobe inferring a full program duration from its fragments.
         probe=subprocess.run(
-            ["/usr/bin/ffprobe","-v","error",
+            [media_executable("ffprobe"),"-v","error",
              "-show_entries","format=duration,format_name:stream=codec_type",
              "-of","json",str(candidate)],
             capture_output=True,text=True,timeout=45)
@@ -370,10 +431,7 @@ def discover_series(page_url, cookies, series_id):
     seen = set()
     target = re.compile(r"^/title/" + re.escape(series_id) + r"/([0-9a-zA-Z]+)/?$")
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(
-            headless=True,
-            executable_path=os.getenv("CHROME_PATH","/usr/bin/chromium"),
-            args=["--no-sandbox"])
+        browser = launch_browser(pw)
         try:
             context = browser.new_context(locale="ja-JP",timezone_id="Asia/Tokyo")
             context.add_cookies(cookies)
@@ -435,7 +493,7 @@ def valid_existing_mp4(path, requested_seconds):
             head=handle.read(min(8_000_000,path.stat().st_size))
         if head[4:8]!=b"ftyp" or b"moov" not in head or b"moof" in head[:4096]:
             return False
-        cmd=["/usr/bin/ffprobe","-v","error","-show_entries",
+        cmd=[media_executable("ffprobe"),"-v","error","-show_entries",
              "format=duration:stream=codec_type","-of","json",str(path)]
         data=json.loads(subprocess.run(
             cmd,check=True,capture_output=True,text=True,timeout=40).stdout)

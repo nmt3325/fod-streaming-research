@@ -5,8 +5,8 @@ Private repository for a command-line demonstration of FOD streaming compatibili
 ## Requirements
 
 - Python 3.13 (the version used for verification)
-- Chromium browser, available at `/usr/bin/chromium` by default
-- FFmpeg and FFprobe, available at `/usr/bin/ffmpeg` and `/usr/bin/ffprobe`
+- Chromium or Google Chrome browser (Playwright-managed Chromium is preferred; macOS Chrome and Linux Chromium are detected automatically)
+- FFmpeg and FFprobe (discovered automatically on Linux and macOS, including Homebrew)
 - Packages in `requirements.txt`
 
 ### Setup (Debian/Ubuntu)
@@ -17,7 +17,27 @@ python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt
 ```
 
-The browser executable can be overridden with the `CHROME_PATH` environment variable; FFmpeg can be overridden with `FOD_FFMPEG_BIN`.
+### Setup (macOS, including Apple Silicon)
+
+With Homebrew installed:
+
+```bash
+brew install ffmpeg
+python3 -m venv venv
+source venv/bin/activate
+python -m pip install -r requirements.txt
+python -m playwright install chromium
+```
+
+A browser is required in addition to the Python `playwright` package. The command `python -m playwright install chromium` installs the Playwright-managed browser. The code also detects Google Chrome in `/Applications` automatically.
+
+The following environment overrides are available:
+
+- `CHROME_PATH`: explicit Chrome/Chromium executable (e.g., `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`)
+- `FOD_FFMPEG_BIN`: explicit FFmpeg executable
+- `FOD_FFPROBE_BIN`: explicit FFprobe executable
+
+On macOS, no `/usr/bin/chromium` path is required. Use `python -m playwright install chromium` if no supported system browser is installed.
 
 ## Usage
 
