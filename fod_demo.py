@@ -27,6 +27,7 @@ from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from playwright.sync_api import sync_playwright
+from subtitle_utils import hls_tracks, hls_inband_captions, dash_tracks, materialize
 from pywidevine.cdm import Cdm
 from pywidevine.device import Device
 from pywidevine.pssh import PSSH
@@ -109,6 +110,7 @@ def arguments():
     parser.add_argument("--list-only", action="store_true", help="シリーズ内のエピソードを一覧表示して終了")
     parser.add_argument("--episodes", help="シリーズで指定した話数のみ（例: 1,3-5）")
     parser.add_argument("--overwrite", action="store_true", help="既存の正常な動画も再取得する")
+    parser.add_argument("--no-subtitles", action="store_true", help="字幕の自動取得・埋め込みを無効にする")
     parser.add_argument("--season", type=int, default=1, help="Jellyfinシーズン番号（既定: 1、特別編は0）")
     parser.add_argument("--year", type=int, help="作品フォルダの制作・公開年（自動検出できない場合に指定）")
     args = parser.parse_args()
@@ -334,7 +336,57 @@ def widevine_keys(session,manifest_xml,device_path,ticket):
     finally:cdm.close(sid)
 
 
-def transcode(media, output, seconds, keys=None):
+
+def subtitle_language(language):
+    primary=(language or "und").lower().split("-",1)[0].split("_",1)[0]
+    return {"ja":"jpn","en":"eng","ko":"kor","zh":"zho",
+            "fr":"fra","de":"deu","es":"spa","it":"ita","pt":"por",
+            "ru":"rus","und":"und"}.get(primary, primary if len(primary)==3 else "und")
+
+
+def available_subtitles(session, mode, manifest_url, manifest_xml, folder,
+                        seconds_limit, notify):
+    """Find accessible subtitle text tracks and prepare a muxable SRT per language."""
+    if mode=="hls":
+        master=get(session,manifest_url).decode("utf-8-sig")
+        choices=hls_tracks(master,manifest_url)
+        if not choices and hls_inband_captions(master):
+            notify("注意：映像内字幕（CC）が宣言されていますが、独立した字幕ファイルはありません。")
+    else:
+        choices=dash_tracks(manifest_xml,manifest_url)
+    if not choices:
+        notify("独立した字幕トラックは検出されませんでした。")
+        return [],True
+    notify(f"字幕トラックを検出しました：{len(choices)}件")
+    results=[]
+    errors=[]
+    urls=set()
+    for idx,track in enumerate(choices[:8]):
+        if track.url in urls:
+            continue
+        urls.add(track.url)
+        directory=folder/f"caption_{idx+1}"
+        directory.mkdir(mode=0o700,exist_ok=True)
+        try:
+            path,cue_count=materialize(
+                track,lambda url:get(session,url),directory,seconds_limit)
+        except Exception as exc:
+            errors.append(f"{track.name}: {type(exc).__name__} - {str(exc).split('?')[0][:100]}")
+            continue
+        results.append({"path":path,"language":subtitle_language(track.language),
+                        "name":track.name,"cues":cue_count})
+        notify(f"字幕を取得しました：{track.name}（{cue_count}行）")
+    if errors:
+        for message in errors[:5]:
+            notify("字幕の取得に失敗：" + message)
+        if not results:
+            raise RuntimeError("字幕は検出されましたが取得できませんでした。"
+                               "詳細："+"; ".join(errors[:2])+
+                               "。字幕なしで続ける場合は --no-subtitles を指定してください")
+    return results,True
+
+
+def transcode(media, output, seconds, keys=None, subtitles=None):
     # The previously selected static ffmpeg can leave an incomplete MP4 when
     # full-episode muxing fails. Keep the final filename untouched until verified.
     ffmpeg_bin = media_executable("ffmpeg")
@@ -342,17 +394,31 @@ def transcode(media, output, seconds, keys=None):
     diagnostic = output.with_suffix(".ffmpeg.log")
     candidate.unlink(missing_ok=True)
     cmd = [ffmpeg_bin, "-hide_banner", "-loglevel", "warning", "-nostdin", "-y"]
+    subtitles=subtitles or []
     if "audio" in media:
         if not keys:
             raise RuntimeError("映像の復号情報がありません")
         cmd += ["-decryption_key", keys[0], "-i", str(media["video"]),
                 "-decryption_key", keys[-1], "-i", str(media["audio"])]
-        cmd += ["-map", "0:v:0", "-map", "1:a:0"]
+        maps=["-map","0:v:0","-map","1:a:0"]
+        subtitle_start_input=2
     else:
-        cmd += ["-i", str(media["video"]), "-map", "0:v:0", "-map", "0:a:0?"]
+        cmd += ["-i", str(media["video"])]
+        maps=["-map","0:v:0","-map","0:a:0?"]
+        subtitle_start_input=1
+    for track in subtitles:
+        cmd += ["-i",str(track["path"])]
+    cmd += maps
+    for i,track in enumerate(subtitles):
+        cmd += ["-map",f"{subtitle_start_input+i}:0"]
     if seconds is not None:
         cmd += ["-t", str(seconds)]
     cmd += ["-c", "copy"]
+    if subtitles:
+        cmd += ["-c:s","mov_text"]
+        for i,track in enumerate(subtitles):
+            cmd += [f"-metadata:s:s:{i}",f"language={track['language']}",
+                    f"-metadata:s:s:{i}",f"title={track['name']}"]
     # Only MPEG-TS inputs carry AAC ADTS framing. Applying this filter to
     # already muxed MP4 inputs can silently remove audio packets.
     source_media=Path(media["video"])
@@ -418,6 +484,9 @@ def transcode(media, output, seconds, keys=None):
         length=float(metadata.get("format",{}).get("duration") or 0)
         if not {"video","audio"}.issubset(stream_types):
             raise RuntimeError("映像と音声の両方が正常に保存されていません")
+        if subtitles and sum(track.get("codec_type")=="subtitle"
+                             for track in metadata.get("streams",[]))<len(subtitles):
+            raise RuntimeError("検出した字幕がMP4に埋め込まれていません")
         if seconds is not None and length<min(seconds*0.85,seconds-0.2):
             raise RuntimeError(f"保存動画の長さが不足しています（{length:.2f}秒）")
         # The short initial MP4 area must contain the full moov sample index
@@ -598,8 +667,16 @@ def download_episode(args,episode_url,dest,jar,cookies, prefix=""):
             else:
                 keys=None
                 media,count=hls_download(session,stream_url,args.seconds,folder,log)
+            subtitles=[]
+            if not args.no_subtitles:
+                subtitles,_=available_subtitles(session,mode,stream_url,
+                    manifest if mode=="dash" else None,folder,args.seconds,log)
+            report["subtitle_checked"]=not args.no_subtitles
+            report["subtitle_tracks"]=[{"language":s["language"],
+                                        "name":s["name"],"cues":s["cues"]}
+                                       for s in subtitles]
             log("3/3 動画を保存しています…")
-            transcode(media,dest,args.seconds,keys)
+            transcode(media,dest,args.seconds,keys,subtitles=subtitles)
         report.update({"status":"success","source_type":mode,"bytes":dest.stat().st_size,
                        "elapsed_seconds":round(time.perf_counter()-begin,2)})
         log("完了しました")
@@ -657,7 +734,14 @@ def main():
         failures=0
         for i,item,dest in targets:
             print(f"\n[{i}/{len(all_episodes)}] {item['title'][:80] or item['episode_id']}",flush=True)
-            if not args.overwrite and valid_existing_mp4(dest,args.seconds):
+            already_valid=(not args.overwrite and valid_existing_mp4(dest,args.seconds))
+            if already_valid and not args.no_subtitles:
+                try:
+                    prior=json.loads(dest.with_suffix(".json").read_text(encoding="utf8"))
+                    already_valid=bool(prior.get("subtitle_checked",False))
+                except (OSError,ValueError):
+                    already_valid=False
+            if already_valid:
                 print("既に保存済みのためスキップします。")
                 entry={"episode":i,"id":item["episode_id"],"status":"skipped",
                        "url":item["url"],"output":str(dest)}

@@ -85,6 +85,29 @@ Other options: `--episodes 1,3-5` selects a subset of series episodes; `--second
 
 `--cookie`, `--wvd` and `--url` remain required arguments. Store the Netscape-format cookie file and device WVD outside the repository. Neither is provided here. Only process media you are authorized to access.
 
+## Automatically included subtitle tracks
+
+The script checks for accessible **independent text subtitle tracks** in the episode's HLS or MPEG-DASH manifest. On supported streams it downloads and converts the timed captions to SRT in a temporary directory and muxes them into the MP4 as **switchable `mov_text`** subtitle streams, tagged with their language. This is not a video burn-in; video and audio are copied without re-encoding.
+
+- HLS: `#EXT-X-MEDIA:TYPE=SUBTITLES` with WebVTT media playlists or directly referenced WebVTT/SRT resources (including segmented WebVTT).
+- DASH: text subtitle adaptations with directly accessible WebVTT, SRT or basic TTML files.
+- Missing subtitles: ordinary MP4 output remains unchanged.
+- Advertised subtitles which cannot be downloaded/parsed: the program reports the problem rather than silently reporting a subtitle-free file as successful.
+- For troubleshooting, `--no-subtitles` explicitly bypasses subtitle extraction.
+- Saved episode `.json` files list embedded subtitle languages and cue counts. If you have an older output without subtitle metadata, re-running the command will inspect subtitles again. `--overwrite` forces a new attempt.
+
+Example:
+
+```bash
+python fod_demo.py \
+  --cookie /path/to/cookie.txt \
+  --wvd /path/to/device.wvd \
+  --url 'https://fod.fujitv.co.jp/title/01bl/01bl110030/' \
+  --output ./Shows
+```
+
+**Limitations:** WebVTT or TTML text tracks are distinct from closed captions stored inside video frames, image-based captions, encrypted subtitle representations, or fragmented DASH `wvtt` / `stpp` assets. These other formats are not automatically extractable by the current text-track implementation. Some FOD titles may have permanently burned-in subtitles or a separate in-player Japanese `字幕ガイド (CC)` switch instead of a downloadable text track. Support for the specific episode above has not been verified end-to-end: the caption processing and muxing were tested with synthetic playlists and local test files, not with its real caption media.
+
 ## Outputs and testing
 
 - Episodes: standard MP4 under `Show (Year)/Season NN/` plus per-episode JSON report.
