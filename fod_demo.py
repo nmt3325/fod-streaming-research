@@ -554,11 +554,53 @@ def detect_year(series_body):
     return int(match.group(1)) if match else None
 
 
-def discover_series(page_url, cookies, series_id):
-    """Discover episode links displayed by this specific series page."""
-    episodes = []
-    seen = set()
+def select_numbered_episodes(raw_links, series_id, base_url):
+    """Prefer numbered episode cards to hero/Continue links and extras.
+
+    Example: The FOD hero tile might say "続きを見る" and promotional
+    interviews may have episode IDs that sort before episode 1.
+    """
+    found = {}
     target = re.compile(r"^/title/" + re.escape(series_id) + r"/([0-9a-zA-Z]+)/?$")
+    number_re = re.compile(r"第\s*([0-9０-９]+)\s*話")
+    for entry in raw_links:
+        href = urljoin(base_url, entry.get("href") or "")
+        uri = urlsplit(href)
+        if uri.hostname != "fod.fujitv.co.jp":
+            continue
+        match = target.fullmatch(uri.path)
+        if not match:
+            continue
+        raw_label = entry.get("title") or ""
+        num = number_re.search(raw_label)
+        if not num:
+            continue
+        number = int(num.group(1))
+        if number < 1:
+            continue
+        clean_label = raw_label[num.start():].strip()
+        eid = match.group(1)
+        item = {"url":urljoin("https://fod.fujitv.co.jp",
+                               uri.path.rstrip("/")+"/"),
+                "episode_id":eid,
+                "episode_number":number,
+                "title":clean_label}
+        existing = found.get(eid)
+        if existing is None or len(item["title"])>len(existing["title"]):
+            found[eid]=item
+    result = sorted(found.values(), key=lambda x:(x["episode_number"],x["episode_id"]))
+    # If there are duplicate episode numbers with different IDs, Jellyfin
+    # filename paths would collide. Refuse to silently overwrite one.
+    positions=[item["episode_number"] for item in result]
+    if len(positions)!=len(set(positions)):
+        raise RuntimeError("同じ話数の異なる動画があります。タイトルと話数を確認してください")
+    return result
+
+
+def discover_series(page_url, cookies, series_id):
+    """Discover numbered episode links displayed by this series page."""
+    gathered = []
+
     with sync_playwright() as pw:
         browser = launch_browser(pw)
         try:
@@ -573,26 +615,12 @@ def discover_series(page_url, cookies, series_id):
                 anchors=page.locator("a[href]").evaluate_all(
                     r"""items => items.map(a => ({href:a.getAttribute('href') || '',
                     title:(a.innerText || a.textContent || '').trim().replace(/\s+/g,' ').slice(0,180)}))""")
-                for entry in anchors:
-                    href=urljoin(page_url,entry["href"])
-                    target_url=urlsplit(href)
-                    if target_url.hostname!="fod.fujitv.co.jp":
-                        continue
-                    match=target.fullmatch(target_url.path)
-                    if not match or match.group(1) in seen:
-                        continue
-                    seen.add(match.group(1))
-                    episodes.append({
-                        "url":urljoin("https://fod.fujitv.co.jp",target_url.path.rstrip("/")+"/"),
-                        "episode_id":match.group(1),
-                        "title":entry["title"].strip()})
+                gathered.extend(anchors)
                 page.evaluate("window.scrollTo(0,document.body.scrollHeight)")
                 page.wait_for_timeout(500)
+            episodes=select_numbered_episodes(gathered,series_id,page_url)
             if not episodes:
-                raise RuntimeError("シリーズページからエピソード一覧を取得できませんでした")
-            # FOD usually displays these chronologically, but numeric episode
-            # IDs give a stable filename and deterministic resumption order.
-            episodes.sort(key=lambda item: item["episode_id"])
+                raise RuntimeError("シリーズページから番号付きエピソードを取得できませんでした")
             return title, episodes, year
         finally:
             browser.close()
@@ -632,6 +660,25 @@ def valid_existing_mp4(path, requested_seconds):
         minimum=50 if requested_seconds is None else max(0.5,requested_seconds*0.85)
         return {"video","audio"}<=types and dur>=minimum
     except (OSError,ValueError,subprocess.SubprocessError):
+        return False
+
+
+def completed_episode(path, args, episode_url):
+    """Do not reuse a partial demo clip as a completed full-length episode."""
+    if not valid_existing_mp4(path, args.seconds):
+        return False
+    try:
+        prior=json.loads(path.with_suffix(".json").read_text(encoding="utf8"))
+        if prior.get("status")!="success":
+            return False
+        if prior.get("requested_seconds")!=args.seconds:
+            return False
+        if prior.get("video_url_path")!=urlsplit(episode_url).path:
+            return False
+        if not args.no_subtitles and not prior.get("subtitle_checked"):
+            return False
+        return True
+    except (OSError,ValueError):
         return False
 
 
@@ -707,14 +754,18 @@ def main():
         year=args.year if args.year is not None else detected_year
         root=library_root_from_output(args.output)
         if args.is_series:
-            positions=parse_selected_episodes(args.episodes,len(all_episodes))
-            chosen=[(i,item) for i,item in enumerate(all_episodes,1) if i in positions]
+            max_number=max(item["episode_number"] for item in all_episodes)
+            positions=parse_selected_episodes(args.episodes,max_number)
+            chosen=[(item["episode_number"],item) for item in all_episodes
+                    if item["episode_number"] in positions]
         else:
             requested=urlsplit(args.url).path.rstrip("/")
-            chosen=[(i,item) for i,item in enumerate(all_episodes,1)
+            chosen=[(item["episode_number"],item) for item in all_episodes
                     if urlsplit(item["url"]).path.rstrip("/")==requested]
             if not chosen:
                 raise RuntimeError("シリーズ一覧に対象エピソードが見つかりません。正しいシリーズURLを確認してください")
+        if not chosen:
+            raise RuntimeError("指定された話数はこのシリーズに存在しません")
         print(f"作品：{title}"+(f" ({year})" if year else "")+
               f" / Season {args.season:02d} / 全{len(all_episodes)}話 / 対象{len(chosen)}話")
         targets=[(i,item,jellyfin_paths(root,title,year,args.season,i,item["title"]))
@@ -734,13 +785,8 @@ def main():
         failures=0
         for i,item,dest in targets:
             print(f"\n[{i}/{len(all_episodes)}] {item['title'][:80] or item['episode_id']}",flush=True)
-            already_valid=(not args.overwrite and valid_existing_mp4(dest,args.seconds))
-            if already_valid and not args.no_subtitles:
-                try:
-                    prior=json.loads(dest.with_suffix(".json").read_text(encoding="utf8"))
-                    already_valid=bool(prior.get("subtitle_checked",False))
-                except (OSError,ValueError):
-                    already_valid=False
+            already_valid=(not args.overwrite and
+                           completed_episode(dest,args,item["url"]))
             if already_valid:
                 print("既に保存済みのためスキップします。")
                 entry={"episode":i,"id":item["episode_id"],"status":"skipped",

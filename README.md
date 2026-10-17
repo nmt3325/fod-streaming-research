@@ -118,3 +118,5 @@ python fod_demo.py \
 - Actual macOS Jellyfin library recognition is not yet confirmed.
 
 Official Jellyfin TV-show naming guide: https://jellyfin.org/docs/general/server/media/shows/
+
+Real-world verification of subtitle availability for episode 01bl110030 and corrected episode numbering: see [LIVE_TEST_01bl.md](LIVE_TEST_01bl.md).
